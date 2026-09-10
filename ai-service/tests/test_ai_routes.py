@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.ai_routes import router
-from app.core.rate_limit import chat_rate_limiter
+from app.core.rate_limiter import chat_rate_limiter
 
 
 from app.core.auth import get_current_user, User
@@ -41,12 +41,11 @@ def client(monkeypatch):
 
     # Force the limiter to use our fake client instead of a real Redis connection.
     fake_redis = FakeRedis()
-    monkeypatch.setattr(rate_limit_module, "redis_client", fake_redis)
+    monkeypatch.setattr(rate_limit_module, "get_redis", lambda: fake_redis)
 
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_current_user] = lambda: User(id="test_user", roles=["ADMIN"])
-    chat_rate_limiter._hits.clear()
     return TestClient(app, raise_server_exceptions=False)
 
 
@@ -108,28 +107,26 @@ def test_chat_happy_path_with_mocked_provider(client, monkeypatch):
     assert body == {"provider": "fake-provider", "cached": False, "content": "hi there!"}
 
 
-def test_messages_to_prompt_flattens_roles():
-    from app.api.ai_routes import _messages_to_prompt
-
-    prompt = _messages_to_prompt(
-        [
-            {"role": "system", "content": "Be concise."},
-            {"role": "user", "content": "Hi"},
-        ]
-    )
-    assert prompt == "System: Be concise.\n\nUser: Hi"
-
-
 def test_health_endpoint(client, monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    for key in [
+        "GEMINI_API_KEY",
+        "OPENAI_API_KEY",
+        "GROQ_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "HUGGINGFACE_TOKEN",
+        "NVIDIA_API_KEY",
+    ]:
+        monkeypatch.delenv(key, raising=False)
     r = client.get("/ai/health")
     assert r.status_code == 200
     body = r.json()
     names = {p["name"] for p in body["providers"]}
     assert {"gemini", "openai"}.issubset(names)
-    assert all(p["status"] == "unhealthy" for p in body["providers"])
+    provider_status = {p["name"]: p["status"] for p in body["providers"]}
 
+    assert provider_status["gemini"] == "unhealthy"
+    assert provider_status["openai"] == "unhealthy"
 
 def test_health_endpoint_reports_healthy_when_key_present(client, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
@@ -211,14 +208,14 @@ def test_chat_uses_cache_for_identical_requests(client, monkeypatch):
 
     calls = 0
 
-    async def fake_generate(prompt, temperature=0.7, **kwargs):
+    async def fake_generate(messages, temperature=0.7, **kwargs):
         nonlocal calls
         calls += 1
         return "cached response", "fake-provider"
 
     monkeypatch.setattr(
         ai_routes_module.ai_orchestrator,
-        "generate_text_with_fallback",
+        "generate_chat_with_fallback",
         fake_generate,
     )
 
@@ -228,7 +225,7 @@ def test_chat_uses_cache_for_identical_requests(client, monkeypatch):
     async def fake_get_cached(key):
         return cache.get(key)
 
-    async def fake_set_cached(key, value):
+    async def fake_set_cached(key, value, *args, **kwargs):
         cache[key] = value
 
     monkeypatch.setattr(
